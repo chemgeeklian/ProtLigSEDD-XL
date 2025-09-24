@@ -18,7 +18,7 @@ import noise_lib
 import utils
 from model import SEDD
 from model.ema import ExponentialMovingAverage
-from transformers import GPT2TokenizerFast, GPT2LMHeadModel
+from transformers import GPT2TokenizerFast, GPT2LMHeadModel, AutoTokenizer
 
 
 torch.backends.cudnn.benchmark = True
@@ -83,6 +83,21 @@ def _run(rank, world_size, cfg):
         mprint("WARNING: Using device {}".format(device))
     mprint(f"Found {os.cpu_count()} total number of CPUs.")
 
+    # load in tokenizer - support using a MolFormer tokenizer for SMILES
+    tokenizer_name = getattr(cfg.data, 'tokenizer', None)
+    if tokenizer_name is None:
+        tokenizer = GPT2TokenizerFast.from_pretrained('gpt2')
+    else:
+        # use AutoTokenizer for external/model-specific tokenizers (MolFormer)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
+
+    # make sure model vocab size (cfg.tokens) matches tokenizer vocab size
+    try:
+        cfg.tokens = int(tokenizer.vocab_size)
+    except Exception:
+        # fallback: leave cfg.tokens unchanged if tokenizer doesn't expose vocab_size
+        pass
+
     # build token graph
     graph = graph_lib.get_graph(cfg, device)
     
@@ -117,11 +132,8 @@ def _run(rank, world_size, cfg):
     initial_step = int(state['step'])
 
     
-    # load in tokenizer
-    tokenizer = GPT2TokenizerFast.from_pretrained('gpt2')
-
-    # Build data iterators
-    train_ds, eval_ds = data.get_dataloaders(cfg)
+    # Build data iterators and pass tokenizer so dataset uses same tokenization
+    train_ds, eval_ds = data.get_dataloaders(cfg, tokenizer=tokenizer)
 
     # mprint(f"Length of datasets: {len(train_ds)}, {len(eval_ds)}")
 

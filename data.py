@@ -1,5 +1,5 @@
 import re
-from transformers import GPT2TokenizerFast
+from transformers import AutoTokenizer, GPT2TokenizerFast
 from datasets import load_dataset
 from itertools import chain
 import numpy as np
@@ -116,7 +116,7 @@ def get_lambada_test_dataset():
     return dataset
 
 
-def get_dataset(name, mode, cache_dir=None, block_size=1024, num_proc=8):
+def get_dataset(name, mode, cache_dir=None, block_size=1024, num_proc=8, tokenizer=None):
     if name == "wikitext103":
         dataset = load_dataset("wikitext", name="wikitext-103-raw-v1", cache_dir=cache_dir)
     elif name == "wikitext2":
@@ -132,6 +132,32 @@ def get_dataset(name, mode, cache_dir=None, block_size=1024, num_proc=8):
         data = dataset
     else:
         data = dataset[mode]
+
+    # detect which column contains the text/SMILES to tokenize
+    def _detect_text_field(ds):
+        # try common SMILES/text column names
+        candidates = [
+            'canonical_smiles', 'smiles', 'smiles_canonical', 'ligand_smiles', 'smiles_std', 'smiles_canon', 'text'
+        ]
+        colnames = []
+        try:
+            colnames = list(ds.column_names)
+        except Exception:
+            try:
+                colnames = list(ds.features.keys())
+            except Exception:
+                colnames = []
+
+        for c in candidates:
+            if c in colnames:
+                return c
+
+        # fallback: prefer the first string-like column name
+        if len(colnames) > 0:
+            return colnames[0]
+        return 'text'
+
+    text_field = _detect_text_field(data)
 
     if name.startswith("wikitext"):
         detokenizer = wt_detokenizer
@@ -151,32 +177,49 @@ def get_dataset(name, mode, cache_dir=None, block_size=1024, num_proc=8):
             return text
         return detok
 
-    tokenizer = GPT2TokenizerFast.from_pretrained('gpt2')
-    EOS = tokenizer.encode(tokenizer.eos_token)[0]
+    # allow passing a tokenizer (e.g. MolFormer AutoTokenizer) from the outside
+    if tokenizer is None:
+        tokenizer = GPT2TokenizerFast.from_pretrained('gpt2')
+
+    # prefer eos token id when available
+    EOS = None
+    try:
+        EOS = tokenizer.eos_token_id if hasattr(tokenizer, 'eos_token_id') else None
+    except Exception:
+        EOS = None
 
     def preprocess_and_tokenize(example):
+        # extract text/SMILES using detected text_field
         if name == "ptb":
             text = example['sentence']
         else:
-            text = example["text"]
+            # datasets returns a dict of lists for batched map; use detected text_field
+            text = example.get(text_field, example.get('text', None))
+            if text is None:
+                # fallback to first available field
+                # example is a dict of lists: pick the first list
+                first_key = list(example.keys())[0]
+                text = example[first_key]
         # print(list(example.keys()))
         # exit()
         
         if detokenizer is not None:
             text = _apply_detokenizer(detokenizer)(text)
 
-        tokens = tokenizer(text, return_attention_mask=False)
+        # tokenizer should support batching; ensure truncation for long SMILES/text
+        tokens = tokenizer(text, return_attention_mask=False, truncation=True)
         # add in EOS token following 
         # https://github.com/jcpeterson/openwebtext/blob/master/tokenize_text.py#L67
-        for token in tokens['input_ids']:
-            token.append(EOS)
+        if EOS is not None:
+            for token in tokens['input_ids']:
+                token.append(EOS)
         return tokens
     
     tokenized_dataset = data.map(preprocess_and_tokenize, batched=True, num_proc=num_proc, load_from_cache_file=True)
+    # Keep the original text/SMILES column (text_field) as metadata so downstream code
+    # can inspect or use it if needed. Only remove the PTB 'sentence' column case.
     if name == "ptb":
         tokenized_dataset = tokenized_dataset.remove_columns('sentence')
-    else:
-        tokenized_dataset = tokenized_dataset.remove_columns('text')
     
 
     def group_texts(examples):
@@ -194,20 +237,25 @@ def get_dataset(name, mode, cache_dir=None, block_size=1024, num_proc=8):
         return result
 
     chunked_dataset = tokenized_dataset.map(group_texts, batched=True, num_proc=num_proc, load_from_cache_file=True)
-    chunked_dataset = chunked_dataset.with_format('torch')
+    # Format only the model input column(s) as torch tensors. Keep 'smiles' (or whatever
+    # the original text_field is) as python objects/strings in the dataset.
+    format_cols = []
+    if 'input_ids' in chunked_dataset.column_names:
+        format_cols.append('input_ids')
+    chunked_dataset = chunked_dataset.with_format('torch', columns=format_cols)
 
     return chunked_dataset
 
 
-def get_dataloaders(config, distributed=True):
+def get_dataloaders(config, distributed=True, tokenizer=None):
     if config.training.batch_size % (config.ngpus * config.training.accum) != 0:
             raise ValueError(f"Train Batch Size {config.training.batch_size} is not divisible by {config.ngpus} gpus with accumulation {config.training.accum}.")
     if config.eval.batch_size % (config.ngpus * config.training.accum) != 0:
         raise ValueError(f"Eval Batch Size for {config.eval.batch_size} is not divisible by {config.ngpus} gpus with accumulation {config.training.accum}.")
 
 
-    train_set = get_dataset(config.data.train, "train", cache_dir=config.data.cache_dir, block_size=config.model.length)
-    valid_set = get_dataset(config.data.valid, "validation" if config.data.valid != "text8" else "test", cache_dir=config.data.cache_dir, block_size=config.model.length)
+    train_set = get_dataset(config.data.train, "train", cache_dir=config.data.cache_dir, block_size=config.model.length, tokenizer=tokenizer)
+    valid_set = get_dataset(config.data.valid, "validation" if config.data.valid != "text8" else "test", cache_dir=config.data.cache_dir, block_size=config.model.length, tokenizer=tokenizer)
 
     if distributed:
         train_sampler = DistributedSampler(train_set) 
